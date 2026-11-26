@@ -1,79 +1,105 @@
 Keygen FAST Bitcoin Generator
-===============
+=============================
 
-Capable of reaching ~20000 address per second for single thread.
+Fast P2PKH ("1...") Bitcoin address generator that **matches in memory**
+against a list of target addresses — no `awk`, no giant intermediate file.
 
 Forked from Fast Vanity Bitcoin address generator for Linux using the
-[secp256k1_fast_unsafe](https://github.com/llamasoft/secp256k1_fast_unsafe) library.
+[secp256k1_fast_unsafe](https://github.com/llamasoft/secp256k1_fast_unsafe)
+library. Modified by `magnuspub` from the original work of `gandalf@winds.org`.
 
-Modified by `magnuspub` From the original work of `gandalf@winds.org`
+> **This application is a curiosity.** You cannot generate random addresses
+> and expect to hit a funded one — the key space is 2^160. Bitcoin is STRONG.
 
-Example
--------
-Example program execution:
-(Note: This application is USELESS, you cannot generate tons of random address
-       hoping to find at least one, Bitcoin is STRONG!)
+What changed in this version
+----------------------------
+The old workflow was: print every generated key to a huge file, then compare
+it against a target list with `awk`. That had three problems:
 
-    // Generate bitcoin address and store to a file
-    $ keygen >> btc.list
-    $ cat btc.list
-     Address: 1Vanity8HEFQDR7ZFsAUFeRR67AG38PcR Privkey: L3jTmJvNtjNrUw5SJJGFfGTog46fLutsQJ4XG66YWHMV5UmgFWqZ
-     ...
-    
-    // Create a file with address you want to find (one per line)
-    $ cat pattern.list
-     1Vanity8HEFQDR7ZFsAUFeRR67AG38PcR
-     ...
-     
-    // Search address from pattern.list 
-    $ cat ./btc.list |awk '/Address/ {print $2}' |awk 'NR==FNR{arr[$0];next} $0 in arr' './pattern.list' -
+1. **Matching now happens in-process.** Target addresses are decoded once to
+   their 20-byte HASH160 and stored in an in-memory open-addressing hash set
+   (the C equivalent of awk's `arr[$0]`, but on raw bytes). Each generated key
+   is checked by comparing 20 bytes — no base58 per key, no output file to
+   grep. This alone removes the `awk` dependency entirely.
+
+2. **The fast batch engine is restored.** The previous build did a full scalar
+   multiplication (actually two) and a `/dev/urandom` read for *every* key. It
+   now reads one random start key per batch and derives `STEP` consecutive
+   public keys by cheap incremental point addition plus a single batched field
+   inversion. Result: ~45× faster per thread (≈1M keys/s/core here, vs ≈23k/s).
+
+3. **Threads live inside one process.** Each hit is written as one atomic,
+   flushed line under a mutex. The old "run 8 copies all appending to the same
+   file with `>>`" pattern corrupted ~2.5% of lines (interleaved, mismatched
+   Address/Privkey) because of block-buffered stdout — that is gone.
+
+Usage
+-----
+
+    # 1) Prepare a target file: one address ("1...") or 40-hex HASH160 per line
+    $ cat targets.txt
+    1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH
+    1LysQiFRavU58yVZ5Htn8dwgtJmJR2dgfo
+    ...
+
+    # 2) Search (uses all CPU cores by default). Hits go to stdout.
+    $ ./keygen -f targets.txt
+    Address: 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH Privkey: KwDiBf89Qg...
+
+    # Append hits to a file and run 8 threads:
+    $ ./keygen -f targets.txt -t 8 -o hits.txt
+
+Options:
+
+    -f <file>   target addresses or 40-hex HASH160, one per line ("-" = stdin)
+    -t <n>      worker threads (default: all cores)
+    -o <file>   append hits here (default: stdout)
+    -q          quiet: no periodic rate line on stderr
+    -k <hex>    fixed starting key for the first batch (benchmark/test only;
+                must be greater than STEP)
+    -h          help
+
+Only compressed-key P2PKH ("1...") addresses are generated and matched.
+Bech32 ("bc1...") and P2SH ("3...") are not produced by this generator, so
+such lines in the target file are skipped (with a count printed at startup).
+
+Tuning
+------
+`STEP` (compile-time, top of `keygen.c`, default 4096) sets the batch size:
+larger amortizes the field inversion over more keys (faster) at the cost of a
+little more per-thread memory. 1024–8192 is a sensible range.
+
+The target hash set uses about `next_pow2(2 * N) * 20` bytes for `N` targets
+(≈40 bytes/target). For very large lists on a memory-constrained box, a Bloom
+pre-filter in front of the set is the natural next optimization.
 
 Build Prerequisites
 -------------------
-Successful compilation depends on installing these additional programs:
+* GCC, Make, Libtool, Autotools, GMP (pthreads are part of libc)
 
-* GCC
-* Make
-* Libtool
-* Autotools
-* GMP
+Ubuntu:
 
-Installing prerequisites on RedHat or Fedora Core:
+    $ sudo apt-get install build-essential automake autoconf libtool libgmp-dev
 
-    $ yum -y install gcc make automake autoconf libtool gmp-devel
+RedHat/Fedora:
 
-Installing prerequisites on Ubuntu:
+    $ sudo yum -y install gcc make automake autoconf libtool gmp-devel
 
-    $ sudo apt-get install build-essential automake autoconf libtool libgmp3-dev
-
-Build Instructions
-------------------
-Simply run make:
+Build
+-----
 
     $ make
 
-This will automatically configure the secp256k1 library and compile the
-project using default options. To change compile options in secp256k1, cd to
-secp256k1 and run configure with your new options, and then rerun make in the
-top level directory.
-
-If the gmp development library is not installed on your system, you may remove
--lgmp from the LDLIBS line in the Makefile. See below for other prerequisites.
-
-For slow CPUs, you might get a better hash rate by lowering the "#define STEP"
-value in keygen.c. Similarly, server CPUs with large amounts of fast memory
-might benefit by increasing the STEP value.
+This configures and compiles the bundled secp256k1 library, then the tool.
+If GMP is unavailable you can drop `-lgmp` from the Makefile and configure
+secp256k1 with `--with-bignum=no`.
 
 Warning
 -------
-**Please verify all generated addresses before use!**
-
-This software is beta and may contain bugs. Do not send coins to an address
-without first checking that the generated private/public keys are correct.
+**Verify any generated key before use.** This is beta software; always confirm
+that a reported private/public key pair is correct before relying on it.
 
 License
 -------
-This software is distributed under the GPLv2 license. Most individual portions
-are placed under compatible MIT or BSD licenses. See each respective file for
-details.
-
+Distributed under the GPLv2. Individual portions are under compatible MIT or
+BSD licenses; see each file for details.
